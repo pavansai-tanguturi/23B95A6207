@@ -2,9 +2,9 @@
 
 ## Screenshots
 <h2>post</h2>
-![Screenshot 1](question/screenshots/Screenshot%202025-06-27%20at%2012.30.50%E2%80%AFPM.png)
+<img width="1236" alt="Image" src="https://github.com/user-attachments/assets/f1469e2e-8b0c-491f-a142-c2d000fc8d87" />
 <h2>get (before response)</h2>
-![Screenshot 2](question/screenshots/Screenshot%202025-06-27%20at%2012.31.30%E2%80%AFPM.png)
+<img width="1236" alt="Image" src="https://github.com/user-attachments/assets/79b08bfe-9397-4efe-b170-19becd66b522" />
 <h2>get (after response)</h2>
-![Screenshot 3](question/screenshots/Screenshot%202025-06-27%20at%2012.36.31%E2%80%AFPM.png)
+<img width="1236" alt="Image" src="https://github.com/user-attachments/assets/6df066cb-2903-476e-880c-bb18e5750502" />
 
