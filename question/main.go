@@ -1,35 +1,61 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
-type Logger interface {
-	Info(msg string, fields map[string]interface{})
-	Error(msg string, fields map[string]interface{})
-	Warn(msg string, fields map[string]interface{})
+const remoteLogURL = "http://20.244.56.144/evaluation-service/logs"
+const fixedLogID = "73e1b67a-0867-4d21-a944-610526724400"
+
+type SimpleLog struct {
+	LogID   string `json:"logID"`
+	Message string `json:"message"`
 }
 
-type CustomLogger struct{}
-
-func (l *CustomLogger) Info(msg string, fields map[string]interface{}) {
-	log.Printf("[INFO] %s %v", msg, fields)
+type DetailedLog struct {
+	LogID   string `json:"logID"`
+	Stack   string `json:"stack"`
+	Level   string `json:"level"`
+	Package string `json:"package"`
+	Message string `json:"message"`
 }
 
-func (l *CustomLogger) Error(msg string, fields map[string]interface{}) {
-	log.Printf("[ERROR] %s %v", msg, fields)
+func sendSimpleLog(message string) {
+	log := SimpleLog{
+		LogID:   fixedLogID,
+		Message: message,
+	}
+	data, _ := json.Marshal(log)
+	http.Post(remoteLogURL, "application/json", bytes.NewBuffer(data))
 }
 
-func (l *CustomLogger) Warn(msg string, fields map[string]interface{}) {
-	log.Printf("[WARN] %s %v", msg, fields)
+func sendDetailedLog(stack, level, pkg, message string) {
+	log := DetailedLog{
+		LogID:   fixedLogID,
+		Stack:   stack,
+		Level:   level,
+		Package: pkg,
+		Message: message,
+	}
+	data, _ := json.Marshal(log)
+	http.Post(remoteLogURL, "application/json", bytes.NewBuffer(data))
+}
+
+func LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := fmt.Sprintf("%s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		sendSimpleLog(msg)
+		next.ServeHTTP(w, r)
+	})
 }
 
 type URLRecord struct {
@@ -40,7 +66,7 @@ type URLRecord struct {
 	ExpiresAt time.Time `json:"expires_at"`
 	Clicks    int       `json:"clicks"`
 }
-type Analytics struct{
+type Analytics struct {
 	Clicks        int       `json:"clicks"`
 	LastAccessed  time.Time `json:"last_accessed"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -64,18 +90,18 @@ type ErrorResponse struct {
 type URLShortenerService struct {
 	storage  map[string]*URLRecord
 	mutex    sync.RWMutex
-	logger   Logger
 	hostname string
 	port     string
 }
-func NewURLShortenerService(logger Logger, hostname, port string) *URLShortenerService {
+
+func NewURLShortenerService(hostname, port string) *URLShortenerService {
 	return &URLShortenerService{
 		storage:  make(map[string]*URLRecord),
-		logger:   logger,
 		hostname: hostname,
 		port:     port,
 	}
 }
+
 func (s *URLShortenerService) generateShortcode() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	const length = 6
@@ -109,28 +135,18 @@ func (s *URLShortenerService) isValidShortcode(shortcode string) bool {
 func (s *URLShortenerService) sendErrorResponse(w http.ResponseWriter, statusCode int, errorMsg, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	
+
 	errorResp := ErrorResponse{
 		Error:   errorMsg,
 		Message: message,
 		Code:    statusCode,
 	}
-	
+
 	json.NewEncoder(w).Encode(errorResp)
-	
-	s.logger.Error("API Error", map[string]interface{}{
-		"status_code": statusCode,
-		"error":       errorMsg,
-		"message":     message,
-	})
+
+	sendDetailedLog("backend", "error", "handler", fmt.Sprintf("%s: %s", errorMsg, message))
 }
 func (s *URLShortenerService) CreateShortURL(w http.ResponseWriter, r *http.Request) {
-	s.logger.Info("Create short URL request received", map[string]interface{}{
-		"method": r.Method,
-		"path":   r.URL.Path,
-		"remote": r.RemoteAddr,
-	})
-
 	if r.Method != http.MethodPost {
 		s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
 		return
@@ -182,7 +198,7 @@ func (s *URLShortenerService) CreateShortURL(w http.ResponseWriter, r *http.Requ
 	}
 	now := time.Now()
 	expiresAt := now.Add(time.Duration(validity) * time.Minute)
-	
+
 	record := &URLRecord{
 		ID:        shortcode,
 		URL:       req.URL,
@@ -195,7 +211,7 @@ func (s *URLShortenerService) CreateShortURL(w http.ResponseWriter, r *http.Requ
 	s.storage[shortcode] = record
 	baseURL := fmt.Sprintf("http://%s:%s", s.hostname, s.port)
 	shortLink := fmt.Sprintf("%s/%s", baseURL, shortcode)
-	
+
 	response := CreateURLResponse{
 		ShortLink: shortLink,
 		Expiry:    expiresAt.Format("2006-01-02T15:04:05Z"),
@@ -205,21 +221,10 @@ func (s *URLShortenerService) CreateShortURL(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(response)
 
-	s.logger.Info("Short URL created successfully", map[string]interface{}{
-		"shortcode":  shortcode,
-		"url":        req.URL,
-		"expires_at": expiresAt,
-		"validity":   validity,
-	})
+	sendSimpleLog(fmt.Sprintf("Short URL created: %s -> %s", req.URL, shortLink))
 }
 func (s *URLShortenerService) RedirectToURL(w http.ResponseWriter, r *http.Request) {
 	shortcode := strings.TrimPrefix(r.URL.Path, "/")
-	
-	s.logger.Info("Redirect request received", map[string]interface{}{
-		"shortcode": shortcode,
-		"method":    r.Method,
-		"remote":    r.RemoteAddr,
-	})
 
 	if r.Method != http.MethodGet {
 		s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
@@ -246,21 +251,12 @@ func (s *URLShortenerService) RedirectToURL(w http.ResponseWriter, r *http.Reque
 	record.Clicks++
 	s.mutex.Unlock()
 
-	s.logger.Info("Redirecting to original URL", map[string]interface{}{
-		"shortcode":    shortcode,
-		"original_url": record.URL,
-		"clicks":       record.Clicks,
-	})
 	http.Redirect(w, r, record.URL, http.StatusFound)
+
+	sendSimpleLog(fmt.Sprintf("Redirected: %s -> %s", shortcode, record.URL))
 }
 func (s *URLShortenerService) GetURLInfo(w http.ResponseWriter, r *http.Request) {
 	shortcode := strings.TrimPrefix(r.URL.Path, "/shorturls/")
-	
-	s.logger.Info("Get URL info request received", map[string]interface{}{
-		"shortcode": shortcode,
-		"method":    r.Method,
-		"remote":    r.RemoteAddr,
-	})
 
 	if r.Method != http.MethodGet {
 		s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
@@ -289,19 +285,10 @@ func (s *URLShortenerService) GetURLInfo(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(record)
 
-	s.logger.Info("URL info retrieved successfully", map[string]interface{}{
-		"shortcode": shortcode,
-		"clicks":    record.Clicks,
-	})
+	sendSimpleLog(fmt.Sprintf("URL info retrieved: %s", shortcode))
 }
 func (s *URLShortenerService) DeleteShortURL(w http.ResponseWriter, r *http.Request) {
 	shortcode := strings.TrimPrefix(r.URL.Path, "/shorturls/")
-	
-	s.logger.Info("Delete short URL request received", map[string]interface{}{
-		"shortcode": shortcode,
-		"method":    r.Method,
-		"remote":    r.RemoteAddr,
-	})
 
 	if r.Method != http.MethodDelete {
 		s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only DELETE method is allowed")
@@ -326,9 +313,7 @@ func (s *URLShortenerService) DeleteShortURL(w http.ResponseWriter, r *http.Requ
 
 	w.WriteHeader(http.StatusNoContent)
 
-	s.logger.Info("Short URL deleted successfully", map[string]interface{}{
-		"shortcode": shortcode,
-	})
+	sendSimpleLog(fmt.Sprintf("Short URL deleted: %s", shortcode))
 }
 func (s *URLShortenerService) GetAnalytics(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -337,12 +322,6 @@ func (s *URLShortenerService) GetAnalytics(w http.ResponseWriter, r *http.Reques
 	if len(parts) >= 3 && parts[1] == "shorturls" && len(parts) >= 4 && parts[3] == "analytics" {
 		shortcode = parts[2]
 	}
-	
-	s.logger.Info("Get analytics request received", map[string]interface{}{
-		"shortcode": shortcode,
-		"method":    r.Method,
-		"remote":    r.RemoteAddr,
-	})
 
 	if r.Method != http.MethodGet {
 		s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
@@ -374,18 +353,10 @@ func (s *URLShortenerService) GetAnalytics(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(analytics)
 
-	s.logger.Info("Analytics retrieved successfully", map[string]interface{}{
-		"shortcode":    shortcode,
-		"total_clicks": record.Clicks,
-	})
+	sendSimpleLog(fmt.Sprintf("Analytics retrieved: %s", shortcode))
 }
 
 func (s *URLShortenerService) ListAllURLs(w http.ResponseWriter, r *http.Request) {
-	s.logger.Info("List all URLs request received", map[string]interface{}{
-		"method": r.Method,
-		"remote": r.RemoteAddr,
-	})
-
 	if r.Method != http.MethodGet {
 		s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
 		return
@@ -417,11 +388,7 @@ func (s *URLShortenerService) ListAllURLs(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
 
-	s.logger.Info("All URLs listed successfully", map[string]interface{}{
-		"total_urls":    len(s.storage),
-		"active_urls":   activeCount,
-		"expired_urls":  expiredCount,
-	})
+	sendSimpleLog(fmt.Sprintf("Listed all URLs: active=%d, expired=%d", activeCount, expiredCount))
 }
 func (s *URLShortenerService) setupRoutes() {
 	http.HandleFunc("/shorturls", func(w http.ResponseWriter, r *http.Request) {
@@ -434,8 +401,7 @@ func (s *URLShortenerService) setupRoutes() {
 			s.sendErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET and POST methods are allowed")
 		}
 	})
-	
-	
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if strings.Contains(path, "/analytics") {
@@ -462,22 +428,17 @@ func (s *URLShortenerService) setupRoutes() {
 }
 
 func main() {
-	logger := &CustomLogger{}
 	hostname := "localhost"
 	port := "8080"
 
-	service := NewURLShortenerService(logger, hostname, port)
+	service := NewURLShortenerService(hostname, port)
 	service.setupRoutes()
 
-	logger.Info("Starting URL Shortener Service", map[string]interface{}{
-		"hostname": hostname,
-		"port":     port,
-		"address":  fmt.Sprintf("%s:%s", hostname, port),
-	})
+	sendSimpleLog("Starting URL Shortener Service")
 
-	if err := http.ListenAndServe(fmt.Sprintf("%s:%s", hostname, port), nil); err != nil {
-		logger.Error("Failed to start server", map[string]interface{}{
-			"error": err.Error(),
-		})
+	handler := LoggingMiddleware(http.DefaultServeMux)
+	if err := http.ListenAndServe(fmt.Sprintf("%s:%s", hostname, port), handler); err != nil {
+		sendDetailedLog("backend", "error", "main", fmt.Sprintf("Failed to start server: %s", err.Error()))
+		os.Exit(1)
 	}
 }
